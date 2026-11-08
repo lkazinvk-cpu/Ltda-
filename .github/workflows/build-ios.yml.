@@ -1,0 +1,554 @@
+name: Build MHGU Recomp iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          mkdir -p source
+          ZIP_FILE=$(find . -maxdepth 2 -type f -iname '*.zip' | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ZIP do projeto não encontrado"
+            exit 1
+          fi
+          unzip -q "$ZIP_FILE" -d source
+          SRC_ROOT=$(find source -type f -path '*/runtime/main.c' -print -quit)
+          if [ -z "$SRC_ROOT" ]; then
+            echo "runtime/main.c não encontrado"
+            exit 1
+          fi
+          SRC_ROOT="${SRC_ROOT%/runtime/main.c}"
+          SRC_ROOT="$GITHUB_WORKSPACE/$SRC_ROOT"
+          test -f "$SRC_ROOT/runtime/platform/ios.c"
+          test -f "$SRC_ROOT/runtime/nvn/vulkan/device.c"
+          echo "SRC_ROOT=$SRC_ROOT" >> "$GITHUB_ENV"
+          echo "Código iOS e runtime encontrados."
+
+      - name: Restore missing updater SHA-256 interface
+        run: |
+          # ldn.c uses SHA-256, but this ZIP omits updater/updater.h.
+          mkdir -p "$SRC_ROOT/updater"
+          cat > "$SRC_ROOT/updater/updater.h" <<'HEADER'
+          #ifndef MHGU_UPDATER_H
+          #define MHGU_UPDATER_H
+          #include <stddef.h>
+          #include <stdint.h>
+          typedef struct {
+              uint32_t h[8];
+              uint64_t len;
+              uint8_t buf[64];
+          } Sha256;
+          void sha256_init(Sha256 *s);
+          void sha256_update(Sha256 *s, const void *data, size_t size);
+          void sha256_hex(Sha256 *s, char out[65]);
+          #endif
+          HEADER
+          test -s "$SRC_ROOT/updater/updater.h"
+          echo "Interface SHA-256 restaurada."
+
+      - name: Make Discord Unix socket portable to iOS
+        run: |
+          python3 - "$SRC_ROOT/runtime/net/discord.c" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          old = "SOCK_STREAM | SOCK_CLOEXEC"
+          if old not in s:
+              if "SOCK_CLOEXEC" in s:
+                  raise SystemExit("SOCK_CLOEXEC encontrado em formato inesperado; patch cancelado.")
+              print("discord.c já está sem SOCK_CLOEXEC.")
+          else:
+              # SOCK_CLOEXEC is Linux-specific and is not declared by the iOS SDK.
+              # The descriptor is short-lived within the app; plain SOCK_STREAM is portable.
+              p.write_text(s.replace(old, "SOCK_STREAM"))
+              print("Discord socket adaptado: SOCK_STREAM (compatível com iOS).")
+          PY
+          ! grep -n "SOCK_CLOEXEC" "$SRC_ROOT/runtime/net/discord.c"
+
+      - name: Prepare SDL3 iOS entry point and app data folder
+        run: |
+          python3 - "$SRC_ROOT/runtime/main.c" "$SRC_ROOT/runtime/ui.c" "$SRC_ROOT/runtime/gamelib.h" <<'PY'
+          import pathlib, sys
+          main = pathlib.Path(sys.argv[1])
+          s = main.read_text()
+          marker = '#include "net/discord.h"'
+          if marker not in s:
+              raise SystemExit('Ponto de inclusão em main.c não encontrado')
+          if '#include <SDL3/SDL.h>' not in s:
+              s = s.replace(marker, marker + '\n#include <SDL3/SDL.h>', 1)
+          if '#include <SDL3/SDL_main.h>' not in s:
+              s = s.replace(marker, marker + '\n#include <SDL3/SDL_main.h>', 1)
+          if 'static void ios_env(void)' not in s:
+              helper = '\n'.join([
+                  '#include <errno.h>',
+                  'static void ios_env(void) {',
+                  '    const char *home = getenv("HOME");',
+                  '    if (!home || !*home) return;',
+                  '    char root[1200], data[1300];',
+                  '    snprintf(root, sizeof root, "%s/Documents/MHGURecomp", home);',
+                  '    if (mkdir(root, 0755) != 0 && errno != EEXIST) return;',
+                  '    snprintf(data, sizeof data, "%s/data", root);',
+                  '    if (mkdir(data, 0755) != 0 && errno != EEXIST) return;',
+                  '    setenv("MHGU_HOME", root, 0);',
+                  '    setenv("MHGU_DATA_DIR", data, 0);',
+                  '    setenv("XDG_DATA_HOME", root, 0);',
+                  '}',
+              ]) + '\n'
+              s = s.replace(marker, marker + '\n' + helper, 1)
+          call = 'int main(int argc, char **argv) {\n'
+          if call not in s:
+              raise SystemExit('Função main não encontrada')
+          if '    ios_env();' not in s:
+              s = s.replace(call, call + '    ios_env();\n', 1)
+          main.write_text(s)
+
+          ui = pathlib.Path(sys.argv[2])
+          u = ui.read_text()
+          u = u.replace('#ifdef __ANDROID__\n    // Touches are not mouse clicks here', '#if defined(__ANDROID__) || defined(__APPLE__)\n    // Touches are not mouse clicks here', 1)
+          ui.write_text(u)
+
+          game_header = pathlib.Path(sys.argv[3])
+          gh = game_header.read_text()
+          old = '#if defined(_WIN32)\n#define GAMELIB_NAME "mhgugame.dll"\n#define GAMELIB_EXPORT __declspec(dllexport)\n#else\n#define GAMELIB_NAME "mhgugame.so"\n#define GAMELIB_EXPORT __attribute__((visibility("default")))\n#endif'
+          new = '#if defined(_WIN32)\n#define GAMELIB_NAME "mhgugame.dll"\n#define GAMELIB_EXPORT __declspec(dllexport)\n#elif defined(__APPLE__)\n#define GAMELIB_NAME "Frameworks/mhgugame.dylib"\n#define GAMELIB_EXPORT __attribute__((visibility("default")))\n#else\n#define GAMELIB_NAME "mhgugame.so"\n#define GAMELIB_EXPORT __attribute__((visibility("default")))\n#endif'
+          if 'Frameworks/mhgugame.dylib' not in gh:
+              if old not in gh: raise SystemExit('Definição GAMELIB_NAME não encontrada')
+              gh = gh.replace(old, new, 1)
+          game_header.write_text(gh)
+          print('SDL_main e ios_env configurados; diretório Documents preparado no início do app.')
+          PY
+
+      - name: Keep iOS app open before game data import
+        run: |
+          echo 'aW1wb3J0IHBhdGhsaWIsIHN5cwpwID0gcGF0aGxpYi5QYXRoKHN5cy5hcmd2WzFdKQpzID0gcC5yZWFkX3RleHQoKQpuZWVkbGUgPSAiICAgIHBsYXRfaW5pdCgpO1xuIgppZiBuZWVkbGUgbm90IGluIHM6CiAgICByYWlzZSBTeXN0ZW1FeGl0KCJtYWluLmM6IHBsYXRfaW5pdCgpIGFuY2hvciBub3QgZm91bmQiKQpwYXRjaCA9ICcnJyAgICBwbGF0X2luaXQoKTsKI2lmIGRlZmluZWQoX19BUFBMRV9fKQogICAgLy8gQSBmcmVzaCBpT1MgaW5zdGFsbCBoYXMgbm8gaW1wb3J0ZWQgZ2FtZSBkdW1wIHlldC4gRG8gbm90IGV4aXQgYmVmb3JlIFNETAogICAgLy8gc3RhcnRzOiBrZWVwIHRoZSBhcHAgYWxpdmUgYW5kIGV4cGxhaW4gdGhlIG1pc3NpbmcgZGF0YSBpbnN0ZWFkLgogICAgewogICAgICAgIGNvbnN0IGNoYXIgKmlvc19kYXRhID0gZ2V0ZW52KCJNSEdVX0RBVEFfRElSIik7CiAgICAgICAgaWYgKCFpb3NfZGF0YSB8fCAhKmlvc19kYXRhKSBpb3NfZGF0YSA9ICJkYXRhIjsKICAgICAgICBjaGFyIGlvc19tYWluX3BhdGhbMTIwMF07CiAgICAgICAgc25wcmludGYoaW9zX21haW5fcGF0aCwgc2l6ZW9mIGlvc19tYWluX3BhdGgsICIlcy9leGVmcy9tYWluIiwgaW9zX2RhdGEpOwogICAgICAgIHN0cnVjdCBzdGF0IGlvc19zdDsKICAgICAgICBpZiAoc3RhdChpb3NfbWFpbl9wYXRoLCAmaW9zX3N0KSAhPSAwKSB7CiAgICAgICAgICAgIGNvbnN0IGNoYXIgKm1zZyA9ICJHYW1lIGRhdGEgaGFzIG5vdCBiZWVuIGltcG9ydGVkIHlldC4gVGhlIGFwcCBpcyBydW5uaW5nLCBidXQgdGhlIGlPUyBmaWxlIGltcG9ydGVyIGlzIG5vdCBpbXBsZW1lbnRlZCBpbiB0aGlzIGJ1aWxkLiI7CiAgICAgICAgICAgIGZwcmludGYoc3RkZXJyLCAiW2lvc10gJXNcXG4iLCBtc2cpOwogICAgICAgICAgICB1aV9pbml0KCk7CiAgICAgICAgICAgIHJldHVybiB1aV9ydW4oKTsKICAgICAgICB9CiAgICB9CiNlbmRpZgonJycKcyA9IHMucmVwbGFjZShuZWVkbGUsIHBhdGNoLCAxKQpwLndyaXRlX3RleHQocykKcHJpbnQoIkFkZGVkIGlPUyBuby1kYXRhIHN0YXJ0dXAgcGF0aC4iKQo=' | base64 -d > /tmp/patch_ios_startup.py
+          python3 /tmp/patch_ios_startup.py "$SRC_ROOT/runtime/main.c"
+
+      - name: Defer guest memory reservation until game boot on iOS
+        run: |
+          python3 - "$SRC_ROOT/runtime/main.c" <<'PYCODE'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          old = """__attribute__((constructor(101))) static void reserve_guest_space(void) {
+              if (plat_reserve_guest(GUEST_BASE, GUEST_SPACE)) return;
+              fprintf(stderr, "FATAL: the guest address window at %llx is not free\\n", GUEST_BASE);
+              exit(1);
+          }"""
+          if old not in s:
+              raise SystemExit("Não encontrei o construtor reserve_guest_space; patch cancelado.")
+          new = """static void reserve_guest_space_for_game(void) {
+              if (!plat_reserve_guest(GUEST_BASE, GUEST_SPACE))
+                  FATAL("the guest address window at %llx is not free\\n", GUEST_BASE);
+          }"""
+          s = s.replace(old, new, 1)
+          marker = "static void boot(const char *root) {\n"
+          if marker not in s:
+              raise SystemExit("Função boot não encontrada")
+          s = s.replace(marker, marker + "    reserve_guest_space_for_game();\n", 1)
+          p.write_text(s)
+          print("Reserva de memória adiada até o início do jogo.")
+          PYCODE
+
+      - name: Download SDL3 and Vulkan headers
+        run: |
+          git clone --depth 1 --branch release-3.4.20 https://github.com/libsdl-org/SDL.git SDL
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git Vulkan-Headers
+          test -f SDL/include/SDL3/SDL.h
+          test -f Vulkan-Headers/include/vulkan/vulkan.h
+
+      - name: Build SDL3 iOS framework
+        run: |
+          # xcodebuild does not accept -derivedDataPath with a -target-only build.
+          # Let Xcode use its default DerivedData location, then locate the product.
+          xcodebuild -quiet -project SDL/Xcode/SDL/SDL.xcodeproj \
+            -target SDL3.xcframework -configuration Release -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO build
+
+          mkdir -p "$GITHUB_WORKSPACE/ios-frameworks"
+          SDL_XCFRAMEWORK=$(find "$HOME/Library/Developer/Xcode/DerivedData" SDL \
+            -type d -name SDL3.xcframework -print -quit 2>/dev/null || true)
+          SDL_FRAMEWORK=""
+          if [ -n "$SDL_XCFRAMEWORK" ]; then
+            SDL_FRAMEWORK=$(find "$SDL_XCFRAMEWORK" -type d -path '*/ios-arm64/SDL3.framework' -print -quit)
+          fi
+          if [ -z "$SDL_FRAMEWORK" ]; then
+            SDL_FRAMEWORK=$(find "$HOME/Library/Developer/Xcode/DerivedData" SDL \
+              -type d -name SDL3.framework -print -quit 2>/dev/null || true)
+          fi
+          if [ -z "$SDL_FRAMEWORK" ]; then
+            echo "SDL3.framework não foi gerado"
+            find "$HOME/Library/Developer/Xcode/DerivedData" SDL -maxdepth 10 \
+              \( -name '*.framework' -o -name '*.xcframework' \) -print 2>/dev/null || true
+            exit 1
+          fi
+          cp -R "$SDL_FRAMEWORK" "$GITHUB_WORKSPACE/ios-frameworks/SDL3.framework"
+          echo "SDL_FRAMEWORK=$GITHUB_WORKSPACE/ios-frameworks/SDL3.framework" >> "$GITHUB_ENV"
+
+      - name: Build MoltenVK iOS framework
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/MoltenVK.git MoltenVK
+          cd MoltenVK
+          ./fetchDependencies --ios
+          xcodebuild -quiet -project MoltenVKPackaging.xcodeproj \
+            -scheme "MoltenVK Package (iOS only)" -configuration Release \
+            -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+          MVK_FRAMEWORK=$(find Package/Release -type d -name MoltenVK.framework -path '*/dynamic/*' -print -quit)
+          if [ -z "$MVK_FRAMEWORK" ]; then MVK_FRAMEWORK=$(find Package/Release -type d -name MoltenVK.framework -print -quit); fi
+          if [ -z "$MVK_FRAMEWORK" ]; then
+            find Package/Release -maxdepth 10 \( -name '*.framework' -o -name '*.xcframework' \) -print || true
+            exit 1
+          fi
+          cp -R "$MVK_FRAMEWORK" "$GITHUB_WORKSPACE/ios-frameworks/MoltenVK.framework"
+          echo "MVK_FRAMEWORK=$GITHUB_WORKSPACE/ios-frameworks/MoltenVK.framework" >> "$GITHUB_ENV"
+
+      - name: Build FFmpeg for iOS arm64
+        run: |
+          git clone --depth 1 --branch n7.1.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          mkdir -p ffmpeg-ios
+          cd ffmpeg
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          CC="$(xcrun --sdk iphoneos --find clang)"
+          AR="$(xcrun --sdk iphoneos --find ar)"
+          RANLIB="$(xcrun --sdk iphoneos --find ranlib)"
+          NM="$(xcrun --sdk iphoneos --find nm)"
+          ./configure \
+            --prefix="$GITHUB_WORKSPACE/ffmpeg-ios" \
+            --target-os=darwin --arch=aarch64 --enable-cross-compile \
+            --cc="$CC" --ar="$AR" --ranlib="$RANLIB" --nm="$NM" \
+            --sysroot="$IOS_SDK" \
+            --extra-cflags="-arch arm64 -miphoneos-version-min=15.0 -isysroot $IOS_SDK -fPIC" \
+            --extra-ldflags="-arch arm64 -miphoneos-version-min=15.0 -isysroot $IOS_SDK" \
+            --enable-pic --enable-static --disable-shared \
+            --disable-programs --disable-doc --disable-debug --disable-network \
+            --disable-autodetect --disable-everything --disable-x86asm \
+            --enable-protocol=file --enable-demuxer=mov \
+            --enable-parser=h264,aac --enable-decoder=h264,aac
+          make -j3
+          make install
+          test -f "$GITHUB_WORKSPACE/ffmpeg-ios/include/libavcodec/avcodec.h"
+          test -f "$GITHUB_WORKSPACE/ffmpeg-ios/lib/libavcodec.a"
+          echo "FFMPEG_IOS=$GITHUB_WORKSPACE/ffmpeg-ios" >> "$GITHUB_ENV"
+
+      - name: Build Shaderc for iOS arm64
+        run: |
+          git clone --depth 1 --recurse-submodules https://github.com/google/shaderc.git shaderc
+          cd shaderc
+          python3 utils/git-sync-deps
+          cd ..
+
+          # Use a single-configuration generator so CMake places archives
+          # in predictable locations (Xcode adds configuration/platform folders).
+          cmake -S shaderc -B shaderc-ios-build -G "Unix Makefiles" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADERC_SKIP_TESTS=ON \
+            -DSHADERC_SKIP_EXAMPLES=ON \
+            -DSHADERC_SKIP_INSTALL=OFF \
+            -DSHADERC_SKIP_COPYRIGHT_CHECK=ON \
+            -DSPIRV_SKIP_EXECUTABLES=ON \
+            -DSPIRV_SKIP_TESTS=ON \
+            -DSPIRV_TOOLS_BUILD_STATIC=ON \
+            -DENABLE_GLSLANG_BINARIES=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DGLSLANG_ENABLE_INSTALL=ON
+
+          cmake --build shaderc-ios-build --config Release --target shaderc_combined --parallel 3
+
+          echo "=== Procurando libshaderc_combined.a ==="
+          SHADERC_LIB=$(find shaderc-ios-build -type f -name 'libshaderc_combined.a' -print -quit)
+          if [ -z "$SHADERC_LIB" ]; then
+            echo "ERRO: o alvo shaderc_combined não gerou libshaderc_combined.a."
+            echo "=== Bibliotecas encontradas ==="
+            find shaderc-ios-build -type f -name '*.a' -print || true
+            echo "=== Alvos CMake relacionados ==="
+            cmake --build shaderc-ios-build --target help | grep -i shaderc || true
+            exit 1
+          fi
+          SHADERC_LIB="$GITHUB_WORKSPACE/$SHADERC_LIB"
+          echo "Biblioteca encontrada: $SHADERC_LIB"
+          echo "SHADERC_LIB=$SHADERC_LIB" >> "$GITHUB_ENV"
+          echo "SHADERC_INCLUDE=$GITHUB_WORKSPACE/shaderc/libshaderc/include" >> "$GITHUB_ENV"
+
+
+      - name: Adapt embedded FSR shaders for Apple Mach-O
+        run: |
+          python3 - "$SRC_ROOT/third_party/fsr-vulkan/src/ffx_fsr3_glsl.c" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text()
+          if '.pushsection .rodata' not in s or '.popsection' not in s:
+              raise SystemExit('Formato esperado de ffx_fsr3_glsl.c não encontrado; não apliquei patch.')
+          # Apple Mach-O assembler uses __TEXT,__const (not ELF .rodata/pushsection).
+          # Mach-O external assembly symbols need the leading underscore.
+          s = s.replace('.pushsection .rodata', '.section __TEXT,__const')
+          s = s.replace('.popsection', '')
+          s = s.replace('.globl ffx_glsl_', '.globl _ffx_glsl_')
+          s = s.replace('\\nffx_glsl_', '\\n_ffx_glsl_')
+          p.write_text(s)
+          print('FSR GLSL embedded assembly adaptado para Mach-O.')
+          PY
+          grep -n 'pushsection\\|popsection' "$SRC_ROOT/third_party/fsr-vulkan/src/ffx_fsr3_glsl.c" && exit 1 || true
+
+      - name: Configure iOS runtime compilation
+        run: |
+          mkdir -p ios-runtime-build
+          cat > ios-runtime-build/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(MHGUIOSRuntime C CXX ASM)
+
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_STANDARD_REQUIRED ON)
+          set(CMAKE_C_EXTENSIONS ON)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(S "$ENV{SRC_ROOT}")
+          set(IMGUI "${S}/third_party/cimgui")
+          set(FSR "${S}/third_party/fsr-vulkan")
+          set(FFX "${FSR}/upstream/ffx-1.1.4/sdk")
+
+          file(GLOB RT_SRC
+            "${S}/runtime/*.c"
+            "${S}/runtime/hle/*.c"
+            "${S}/runtime/services/*.c"
+            "${S}/runtime/net/*.c"
+            "${S}/updater/sha256.c"
+            "${S}/runtime/nvn/vulkan/*.c"
+          )
+
+          list(APPEND RT_SRC
+            "${S}/runtime/nvn/objects.c"
+            "${S}/runtime/nvn/cmdbuf.c"
+            "${S}/runtime/nvn/nvn_args.c"
+            "${S}/runtime/nvn/tegra.c"
+            "${S}/runtime/nvn/formats.c"
+            "${S}/runtime/nvn/backend_null.c"
+            "${S}/runtime/nvn/astc.c"
+            "${S}/runtime/nvn/bcn.c"
+            "${S}/runtime/nvn/maxwell/translate.c"
+            "${S}/runtime/platform/ios.c"
+            "${S}/third_party/volk/volk.c"
+          )
+
+          set(IMGUI_SRC
+            "${IMGUI}/cimgui.cpp"
+            "${IMGUI}/imgui/imgui.cpp"
+            "${IMGUI}/imgui/imgui_draw.cpp"
+            "${IMGUI}/imgui/imgui_tables.cpp"
+            "${IMGUI}/imgui/imgui_widgets.cpp"
+            "${IMGUI}/imgui/imgui_demo.cpp"
+            "${IMGUI}/imgui/backends/imgui_impl_vulkan.cpp"
+          )
+
+          set(FSR_C
+            "${FSR}/src/ffx_vk_portable.c"
+            "${FSR}/src/ffx_fsr3_glsl.c"
+          )
+          set(FSR_CXX
+            "${FSR}/src/ffx_vk_fsr3_portable.cpp"
+            "${FSR}/src/ffx_fsr3_shaderblobs.cpp"
+            "${FFX}/src/shared/ffx_assert.cpp"
+            "${FFX}/src/shared/ffx_message.cpp"
+            "${FFX}/src/shared/ffx_object_management.cpp"
+            "${FFX}/src/shared/ffx_breadcrumbs_list.cpp"
+            "${FFX}/src/components/fsr3upscaler/ffx_fsr3upscaler.cpp"
+            "${FFX}/src/backends/vk/ffx_vk.cpp"
+            "${FFX}/src/backends/shared/ffx_shader_blobs.cpp"
+          )
+
+          add_library(mhgu_ios_runtime STATIC
+            ${RT_SRC}
+            "${S}/runtime/overlay.cpp"
+            "${S}/runtime/settings_panel.cpp"
+            "${S}/runtime/touch.cpp"
+            "${S}/runtime/perfstats.cpp"
+            "${IMGUI_SRC}"
+            "${S}/runtime/nvn/vulkan/vma.cpp"
+            ${FSR_C}
+            ${FSR_CXX}
+          )
+
+          target_include_directories(mhgu_ios_runtime PRIVATE
+            "${S}/runtime"
+            "${S}/third_party/volk"
+            "${S}/third_party/vk_mem_alloc"
+            "${IMGUI}"
+            "${IMGUI}/imgui"
+            "${FSR}/include"
+            "${S}/third_party/ffx-api"
+            "$ENV{GITHUB_WORKSPACE}/SDL/include"
+            "$ENV{SDL_FRAMEWORK}/Headers"
+            "$ENV{GITHUB_WORKSPACE}/Vulkan-Headers/include"
+            "$ENV{SHADERC_INCLUDE}"
+            "$ENV{FFMPEG_IOS}/include"
+          )
+
+          target_compile_definitions(mhgu_ios_runtime PRIVATE
+            GAMELIB_ID=\"ios-compile-check\"
+            SHADER_ID=\"ios-compile-check\"
+            MHGU_VERSION=\"0.1.6\"
+            FSR4_DRIVER_PATCH=0
+            CIMGUI_NO_EXPORT
+            VK_NO_PROTOTYPES
+            VK_USE_PLATFORM_METAL_EXT
+            VK_USE_PLATFORM_IOS_MVK
+            VMA_STATIC_VULKAN_FUNCTIONS=1
+            VMA_DYNAMIC_VULKAN_FUNCTIONS=0
+            FFX_VK_PORTABLE_HAS_FSR3_UPSCALER=1
+            FFX_FSR3UPSCALER=1
+            DISABLE_FFX_DEBUG_BREAK=1
+          )
+
+          target_link_libraries(mhgu_ios_runtime PRIVATE
+            "$ENV{SHADERC_LIB}"
+            "$ENV{FFMPEG_IOS}/lib/libavformat.a"
+            "$ENV{FFMPEG_IOS}/lib/libavcodec.a"
+            "$ENV{FFMPEG_IOS}/lib/libavutil.a"
+          )
+
+          target_compile_options(mhgu_ios_runtime PRIVATE
+            "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-include ${S}/third_party/volk/volk.h>"
+            "$<$<COMPILE_LANGUAGE:C>:-fno-strict-aliasing;-Wno-unused-function;-Wno-unused-variable;-Wno-unused-but-set-variable>"
+          )
+
+          set_source_files_properties(${IMGUI_SRC}
+            "${S}/runtime/overlay.cpp"
+            "${S}/runtime/settings_panel.cpp"
+            "${S}/runtime/touch.cpp"
+            "${S}/runtime/perfstats.cpp"
+            PROPERTIES COMPILE_OPTIONS "-O2;-fvisibility=hidden;-w"
+          )
+          set_source_files_properties("${S}/runtime/nvn/vulkan/vma.cpp" PROPERTIES COMPILE_OPTIONS "-O2;-w")
+          set_source_files_properties(${FSR_C} PROPERTIES COMPILE_OPTIONS "-O2;-w;-std=c11")
+          set_source_files_properties(${FSR_CXX} PROPERTIES
+            COMPILE_OPTIONS "-O2;-w;-std=c++17;-include;${FSR}/src/ffx_1_1_4_portability.hpp"
+          )
+          set_property(SOURCE ${FSR_C} ${FSR_CXX} APPEND PROPERTY COMPILE_DEFINITIONS
+            FFX_VK_PORTABLE_HAS_FSR3_UPSCALER=1 FFX_FSR3UPSCALER=1 DISABLE_FFX_DEBUG_BREAK=1
+          )
+          set_property(SOURCE ${FSR_C} ${FSR_CXX} APPEND PROPERTY INCLUDE_DIRECTORIES
+            "${FSR}/include" "${FFX}/include" "${FFX}/src/shared" "${FFX}/src/components"
+            "${FFX}/src/backends/shared" "${FFX}/src/backends/shared/blob_accessors"
+          )
+          set_property(SOURCE "${FSR}/src/ffx_fsr3_glsl.c" APPEND PROPERTY COMPILE_DEFINITIONS
+            FFX_GPU_DIR="${FFX}/include/FidelityFX/gpu"
+            FFX_PASS_DIR="${FFX}/src/backends/vk/shaders/fsr3upscaler"
+          )
+          CMAKE
+
+          cmake -S ios-runtime-build -B ios-runtime-build/out -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile iOS runtime sources
+        run: cmake --build ios-runtime-build/out --config Release --parallel 3
+
+      - name: Create iOS app bundle project
+        run: |
+          mkdir -p ios-app
+          cat > ios-app/anchor.m <<'OBJC'
+          #import <UIKit/UIKit.h>
+          void mhgu_ios_app_anchor(void) { }
+          OBJC
+          cat > ios-app/Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleDisplayName</key><string>MHGU Recomp</string>
+            <key>CFBundleExecutable</key><string>MHGURecomp</string>
+            <key>CFBundleIdentifier</key><string>com.mhgurecomp.ios</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>MHGURecomp</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.1.6</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>UIFileSharingEnabled</key><true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+            <key>UIRequiresFullScreen</key><true/>
+            <key>UISupportedInterfaceOrientations</key>
+            <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+            <key>UILaunchScreen</key><dict/>
+          </dict></plist>
+          PLIST
+          cat > ios-app/CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(MHGURecompApp LANGUAGES C OBJC)
+          set(CMAKE_OSX_DEPLOYMENT_TARGET 15.0)
+          set(RUNTIME_LIB "$ENV{GITHUB_WORKSPACE}/ios-runtime-build/out/Release-iphoneos/libmhgu_ios_runtime.a")
+          if(NOT EXISTS "${RUNTIME_LIB}")
+            file(GLOB_RECURSE RUNTIME_CANDIDATES "$ENV{GITHUB_WORKSPACE}/ios-runtime-build/out/*/libmhgu_ios_runtime.a")
+            list(LENGTH RUNTIME_CANDIDATES N_RUNTIME)
+            if(N_RUNTIME EQUAL 0)
+              message(FATAL_ERROR "libmhgu_ios_runtime.a não encontrado")
+            endif()
+            list(GET RUNTIME_CANDIDATES 0 RUNTIME_LIB)
+          endif()
+          add_executable(MHGURecomp MACOSX_BUNDLE anchor.m)
+          set_target_properties(MHGURecomp PROPERTIES
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.mhgurecomp.ios"
+            XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "15.0"
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+            XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
+            XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO"
+            XCODE_ATTRIBUTE_LD_RUNPATH_SEARCH_PATHS "@executable_path/Frameworks @loader_path/Frameworks"
+          )
+          target_link_libraries(MHGURecomp PRIVATE
+            "${RUNTIME_LIB}" "$ENV{SHADERC_LIB}"
+            "$ENV{FFMPEG_IOS}/lib/libavformat.a"
+            "$ENV{FFMPEG_IOS}/lib/libavcodec.a"
+            "$ENV{FFMPEG_IOS}/lib/libavutil.a"
+            "-framework SDL3" "-framework MoltenVK"
+            "-framework UIKit" "-framework Foundation" "-framework Metal"
+            "-framework QuartzCore" "-framework GameController"
+            "-framework AVFoundation" "-framework AudioToolbox"
+            "-framework CoreGraphics" "-framework CoreMotion" "-framework CoreVideo"
+            z m c++
+          )
+          target_link_options(MHGURecomp PRIVATE
+            "-F$ENV{GITHUB_WORKSPACE}/ios-frameworks"
+            "-Wl,-rpath,@executable_path/Frameworks"
+          )
+          CMAKE
+
+      - name: Link app and package unsigned IPA
+        run: |
+          cmake -S ios-app -B ios-app/out -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build ios-app/out --config Release --parallel 3
+          APP=$(find ios-app/out -type d -name 'MHGURecomp.app' -print -quit)
+          if [ -z "$APP" ]; then echo "MHGURecomp.app não foi gerado"; exit 1; fi
+          mkdir -p "$APP/Frameworks"
+          cp -R "$SDL_FRAMEWORK" "$APP/Frameworks/SDL3.framework"
+          cp -R "$MVK_FRAMEWORK" "$APP/Frameworks/MoltenVK.framework"
+          mkdir -p Payload
+          cp -R "$APP" Payload/MHGURecomp.app
+          ditto -c -k --sequesterRsrc --keepParent Payload MHGURecomp-unsigned.ipa
+          ls -lh MHGURecomp-unsigned.ipa
+          unzip -l MHGURecomp-unsigned.ipa | head -40
+
+      - name: Upload iOS app and IPA artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MHGURecomp-iOS-unsigned-IPA
+          path: MHGURecomp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
